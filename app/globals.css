@@ -115,8 +115,16 @@ button:disabled {
   cursor: cell;
 }
 
+.tool-tear .cloth-canvas {
+  cursor: crosshair;
+}
+
 .cloth-canvas.is-grabbing {
   cursor: grabbing;
+}
+
+.cloth-canvas.is-cutting {
+  cursor: crosshair;
 }
 
 .stage-vignette {

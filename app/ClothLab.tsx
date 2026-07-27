@@ -18,7 +18,10 @@ import {
   type PinPattern,
 } from "./cloth-physics";
 
-type ToolMode = "orbit" | "grab" | "pin";
+type ToolMode = "orbit" | "grab" | "pin" | "tear";
+
+/** World-space radius of the shear cut made by the tear tool. */
+const TEAR_RADIUS = 0.17;
 
 type LabSettings = ClothSettings & {
   wireframe: boolean;
@@ -38,6 +41,7 @@ type FabricPreset = {
   bend: number;
   damping: number;
   friction: number;
+  tearStrain: number;
 };
 
 type SceneApi = {
@@ -66,6 +70,7 @@ const PRESETS: FabricPreset[] = [
     bend: 0.08,
     damping: 0.991,
     friction: 0.12,
+    tearStrain: 0.16,
   },
   {
     id: "cotton",
@@ -79,6 +84,7 @@ const PRESETS: FabricPreset[] = [
     bend: 0.24,
     damping: 0.995,
     friction: 0.34,
+    tearStrain: 0.28,
   },
   {
     id: "denim",
@@ -92,6 +98,7 @@ const PRESETS: FabricPreset[] = [
     bend: 0.48,
     damping: 0.997,
     friction: 0.54,
+    tearStrain: 0.44,
   },
   {
     id: "leather",
@@ -105,6 +112,7 @@ const PRESETS: FabricPreset[] = [
     bend: 0.68,
     damping: 0.998,
     friction: 0.68,
+    tearStrain: 0.66,
   },
 ];
 
@@ -118,6 +126,8 @@ const DEFAULT_SETTINGS: LabSettings = {
   damping: PRESETS[1].damping,
   friction: PRESETS[1].friction,
   selfCollision: true,
+  tearEnabled: true,
+  tearStrain: PRESETS[1].tearStrain,
   wireframe: false,
   formVisible: true,
   showColliders: false,
@@ -214,6 +224,7 @@ export default function ClothLab() {
   const [fps, setFps] = useState(60);
   const [strain, setStrain] = useState({ average: 0, max: 0 });
   const [pinCount, setPinCount] = useState(2);
+  const [integrity, setIntegrity] = useState(1);
   const [quality, setQuality] = useState("35 × 29");
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
@@ -249,6 +260,7 @@ export default function ClothLab() {
       bend: next.bend,
       damping: next.damping,
       friction: next.friction,
+      tearStrain: next.tearStrain,
     }));
   }, []);
 
@@ -293,6 +305,8 @@ export default function ClothLab() {
         setTool("grab");
       } else if (event.key.toLowerCase() === "p") {
         setTool("pin");
+      } else if (event.key.toLowerCase() === "t") {
+        setTool("tear");
       } else if (event.key.toLowerCase() === "o") {
         setTool("orbit");
       } else if (event.key === "ArrowLeft") {
@@ -431,14 +445,29 @@ export default function ClothLab() {
     positionAttribute.setUsage(THREE.DynamicDrawUsage);
     clothGeometry.setAttribute("position", positionAttribute);
     clothGeometry.setAttribute("uv", new THREE.BufferAttribute(simulation.uvs, 2));
-    clothGeometry.setIndex(new THREE.BufferAttribute(simulation.indices, 1));
+    const indexAttribute = new THREE.BufferAttribute(simulation.indices, 1);
+    indexAttribute.setUsage(THREE.DynamicDrawUsage);
+    clothGeometry.setIndex(indexAttribute);
+    clothGeometry.setDrawRange(0, simulation.activeIndexCount);
     clothGeometry.computeVertexNormals();
     clothGeometry.boundingSphere = new THREE.Sphere(
       new THREE.Vector3(0, 0, -0.3),
       12,
     );
 
+    // Torn triangles are compacted out of the index buffer, so the draw range
+    // only has to be resynced when the simulation reports a topology change.
+    let lastTopology = -1;
+    const syncTopology = () => {
+      if (simulation.topologyVersion === lastTopology) return;
+      lastTopology = simulation.topologyVersion;
+      indexAttribute.needsUpdate = true;
+      clothGeometry.setDrawRange(0, simulation.activeIndexCount);
+      setIntegrity(simulation.integrity);
+    };
+
     const syncGeometry = () => {
+      syncTopology();
       positionAttribute.needsUpdate = true;
       clothGeometry.computeVertexNormals();
     };
@@ -573,6 +602,7 @@ export default function ClothLab() {
     const barycentric = new THREE.Vector3();
     const triangle = new THREE.Triangle();
     let activePointer: number | null = null;
+    let cutting = false;
 
     const updatePointer = (event: PointerEvent) => {
       const rect = renderer.domElement.getBoundingClientRect();
@@ -607,6 +637,17 @@ export default function ClothLab() {
         return;
       }
 
+      if (toolRef.current === "tear") {
+        activePointer = event.pointerId;
+        cutting = true;
+        renderer.domElement.setPointerCapture(event.pointerId);
+        controls.enabled = false;
+        renderer.domElement.classList.add("is-cutting");
+        simulation.tearAt(hit.point, TEAR_RADIUS);
+        syncGeometry();
+        return;
+      }
+
       if (toolRef.current !== "grab") return;
       activePointer = event.pointerId;
       renderer.domElement.setPointerCapture(event.pointerId);
@@ -622,7 +663,16 @@ export default function ClothLab() {
     };
 
     const handlePointerMove = (event: PointerEvent) => {
-      if (activePointer !== event.pointerId || !simulation.isDragging) return;
+      if (activePointer !== event.pointerId) return;
+
+      if (cutting) {
+        updatePointer(event);
+        const hit = raycaster.intersectObject(clothMesh, false)[0];
+        if (hit && simulation.tearAt(hit.point, TEAR_RADIUS)) syncGeometry();
+        return;
+      }
+
+      if (!simulation.isDragging) return;
       updatePointer(event);
       if (raycaster.ray.intersectPlane(dragPlane, dragTarget)) {
         simulation.updateDragTarget(dragTarget);
@@ -645,9 +695,11 @@ export default function ClothLab() {
         renderer.domElement.releasePointerCapture(activePointer);
       }
       activePointer = null;
+      cutting = false;
       simulation.endDrag();
       controls.enabled = true;
       renderer.domElement.classList.remove("is-grabbing");
+      renderer.domElement.classList.remove("is-cutting");
     };
 
     renderer.domElement.addEventListener("pointerdown", handlePointerDown);
@@ -816,8 +868,17 @@ export default function ClothLab() {
     () =>
       `${preset.label} preset, ${settings.wind.toFixed(1)} meters per second wind, ${
         settings.selfCollision ? "self-collision on" : "self-collision off"
-      }, ${pinCount} active pins, simulation ${paused ? "paused" : "running"}.`,
-    [paused, pinCount, preset.label, settings.selfCollision, settings.wind],
+      }, ${pinCount} active pins, ${Math.round(
+        integrity * 100,
+      )} percent of the weave intact, simulation ${paused ? "paused" : "running"}.`,
+    [
+      integrity,
+      paused,
+      pinCount,
+      preset.label,
+      settings.selfCollision,
+      settings.wind,
+    ],
   );
 
   return (
@@ -844,12 +905,14 @@ export default function ClothLab() {
             ? "Drag the cloth to test its response"
             : tool === "pin"
               ? "Click the fabric to place or release a pin"
-              : "Drag to orbit · scroll to zoom"}
+              : tool === "tear"
+                ? "Drag across the fabric to rip it open"
+                : "Drag to orbit · scroll to zoom"}
         </div>
       </div>
 
       <p id="viewport-instructions" className="sr-only">
-        Use O, G, and P to select orbit, grab, and pin tools. Arrow keys orbit,
+        Use O, G, P, and T to select orbit, grab, pin, and tear tools. Arrow keys orbit,
         plus and minus zoom, Enter pins the fabric at the center when the pin
         tool is active, Space pauses, and R resets.
       </p>
@@ -899,6 +962,7 @@ export default function ClothLab() {
             ["orbit", "01", "Orbit", "O"],
             ["grab", "02", "Grab", "G"],
             ["pin", "03", "Pin", "P"],
+            ["tear", "04", "Tear", "T"],
           ] as const
         ).map(([id, number, label, key]) => (
           <button
@@ -1012,6 +1076,27 @@ export default function ClothLab() {
 
         <section className="inspector-section">
           <div className="section-title">
+            <h3>Tear strength</h3>
+            <span>{Math.round(integrity * 100)}% intact</span>
+          </div>
+          <RangeControl
+            label="Breaking elongation"
+            value={settings.tearStrain}
+            min={0.05}
+            max={1.2}
+            step={0.01}
+            displayValue={`${Math.round(settings.tearStrain * 100)}%`}
+            onChange={(value) => setSetting("tearStrain", value)}
+          />
+          <Toggle
+            label="Rip under stress"
+            checked={settings.tearEnabled}
+            onChange={(checked) => setSetting("tearEnabled", checked)}
+          />
+        </section>
+
+        <section className="inspector-section">
+          <div className="section-title">
             <h3>Environment</h3>
             <span>World</span>
           </div>
@@ -1114,7 +1199,10 @@ export default function ClothLab() {
         <div className="strain-meter">
           <div className="strain-label">
             <span>Live strain</span>
-            <span>{Math.min(99, Math.round(strain.max * 100))}% peak</span>
+            <span>
+              {Math.min(99, Math.round(strain.max * 100))}% peak
+              {integrity < 1 ? ` · ${Math.round(integrity * 100)}% intact` : ""}
+            </span>
           </div>
           <div className="strain-track" aria-hidden="true">
             <span
@@ -1174,6 +1262,14 @@ export default function ClothLab() {
                 <h3>Pin</h3>
                 <p>Click to hold or release a vertex. Shift-click works in any tool.</p>
               </article>
+              <article>
+                <span>04</span>
+                <h3>Tear</h3>
+                <p>
+                  Drag to cut the weave. Fabric also rips on its own once a
+                  thread stretches past its breaking point.
+                </p>
+              </article>
             </div>
             <div className="keyboard-line">
               <span>
@@ -1187,6 +1283,9 @@ export default function ClothLab() {
               </span>
               <span>
                 <kbd>P</kbd> pin
+              </span>
+              <span>
+                <kbd>T</kbd> tear
               </span>
             </div>
           </section>

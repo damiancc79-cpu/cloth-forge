@@ -12,6 +12,8 @@ export type ClothSettings = {
   damping: number;
   friction: number;
   selfCollision: boolean;
+  tearEnabled: boolean;
+  tearStrain: number;
 };
 
 type SphereCollider = {
@@ -29,6 +31,11 @@ const FLOOR_Y = -2.2;
 const CLOTH_THICKNESS = 0.045;
 const FIXED_SUBSTEPS = 3;
 const SOLVER_ITERATIONS = 6;
+
+// Diagonals carry less of the load than the grain, so they are allowed to
+// stretch further before failing. Tears then run along the weave instead of
+// shattering the quad into loose triangles.
+const SHEAR_TEAR_TOLERANCE = 1.35;
 
 const FORM_COLLIDERS: SphereCollider[] = [
   { center: [0, 2.1, -0.36], radius: 0.47 },
@@ -60,8 +67,21 @@ export class ClothSimulation {
   private readonly constraintB: Uint32Array;
   private readonly constraintRest: Float32Array;
   private readonly constraintType: Uint8Array;
+  private readonly constraintBroken: Uint8Array;
   private readonly acceleration: Float32Array;
   private readonly customPins = new Set<number>();
+
+  /** Pristine triangle list. `indices` holds the surviving subset, compacted. */
+  private readonly baseIndices: Uint32Array;
+  /** Constraint index for each of a triangle's three bounding edges. */
+  private readonly triangleEdges: Int32Array;
+  /** `min(i,j) * count + max(i,j)` to constraint index. */
+  private readonly edgeLookup = new Map<number, number>();
+  private readonly weaveTotal: number;
+
+  private activeIndices = 0;
+  private brokenWeave = 0;
+  private topology = 0;
   private pinPattern: PinPattern = "shoulders";
   private drag: DragConstraint | null = null;
   private elapsed = 0;
@@ -82,13 +102,24 @@ export class ClothSimulation {
     this.acceleration = new Float32Array(this.count * 3);
 
     this.buildInitialCape();
-    this.indices = this.buildTriangles();
+    this.baseIndices = this.buildTriangles();
+    this.indices = new Uint32Array(this.baseIndices);
 
     const constraints = this.buildConstraints();
     this.constraintA = constraints.a;
     this.constraintB = constraints.b;
     this.constraintRest = constraints.rest;
     this.constraintType = constraints.type;
+    this.constraintBroken = new Uint8Array(this.constraintA.length);
+
+    let weave = 0;
+    for (let c = 0; c < this.constraintType.length; c += 1) {
+      if (this.constraintType[c] !== 2) weave += 1;
+    }
+    this.weaveTotal = weave;
+
+    this.triangleEdges = this.buildTriangleEdges();
+    this.rebuildTopology();
 
     this.setMass(1);
     this.setPinPattern("shoulders");
@@ -155,6 +186,7 @@ export class ClothSimulation {
       const dx = this.initial[ib] - this.initial[ia];
       const dy = this.initial[ib + 1] - this.initial[ia + 1];
       const dz = this.initial[ib + 2] - this.initial[ia + 2];
+      this.edgeLookup.set(this.edgeKey(i, j), a.length);
       a.push(i);
       b.push(j);
       rest.push(Math.hypot(dx, dy, dz));
@@ -181,6 +213,132 @@ export class ClothSimulation {
       rest: new Float32Array(rest),
       type: new Uint8Array(type),
     };
+  }
+
+  private edgeKey(i: number, j: number) {
+    return i < j ? i * this.count + j : j * this.count + i;
+  }
+
+  private buildTriangleEdges() {
+    const triangles = this.baseIndices.length / 3;
+    const edges = new Int32Array(triangles * 3);
+    for (let t = 0; t < triangles; t += 1) {
+      const i0 = this.baseIndices[t * 3];
+      const i1 = this.baseIndices[t * 3 + 1];
+      const i2 = this.baseIndices[t * 3 + 2];
+      edges[t * 3] = this.edgeLookup.get(this.edgeKey(i0, i1)) ?? -1;
+      edges[t * 3 + 1] = this.edgeLookup.get(this.edgeKey(i1, i2)) ?? -1;
+      edges[t * 3 + 2] = this.edgeLookup.get(this.edgeKey(i2, i0)) ?? -1;
+    }
+    return edges;
+  }
+
+  private isEdgeSevered(i: number, j: number) {
+    const edge = this.edgeLookup.get(this.edgeKey(i, j));
+    return edge === undefined || this.constraintBroken[edge] === 1;
+  }
+
+  private breakConstraint(c: number) {
+    if (this.constraintBroken[c]) return false;
+    this.constraintBroken[c] = 1;
+    if (this.constraintType[c] !== 2) this.brokenWeave += 1;
+    return true;
+  }
+
+  /**
+   * Drops every triangle that lost a bounding edge and compacts the survivors
+   * to the front of the index buffer.
+   */
+  private rebuildTopology() {
+    // A bend spring spans two grain edges. Once either is severed the fabric
+    // between its endpoints is gone, so the spring must stop holding the two
+    // sides of the rip together.
+    for (let c = 0; c < this.constraintType.length; c += 1) {
+      if (this.constraintType[c] !== 2 || this.constraintBroken[c]) continue;
+      const i = this.constraintA[c];
+      const j = this.constraintB[c];
+      const mid = j - i === 2 ? i + 1 : i + this.cols;
+      if (this.isEdgeSevered(i, mid) || this.isEdgeSevered(mid, j)) {
+        this.constraintBroken[c] = 1;
+      }
+    }
+
+    let cursor = 0;
+    const triangles = this.baseIndices.length / 3;
+    for (let t = 0; t < triangles; t += 1) {
+      const e0 = this.triangleEdges[t * 3];
+      const e1 = this.triangleEdges[t * 3 + 1];
+      const e2 = this.triangleEdges[t * 3 + 2];
+      if (
+        (e0 >= 0 && this.constraintBroken[e0]) ||
+        (e1 >= 0 && this.constraintBroken[e1]) ||
+        (e2 >= 0 && this.constraintBroken[e2])
+      ) {
+        continue;
+      }
+      this.indices[cursor] = this.baseIndices[t * 3];
+      this.indices[cursor + 1] = this.baseIndices[t * 3 + 1];
+      this.indices[cursor + 2] = this.baseIndices[t * 3 + 2];
+      cursor += 3;
+    }
+
+    // three.js computes vertex normals over the entire index buffer rather
+    // than the draw range, so the tail is filled with degenerate triangles —
+    // they render nothing and contribute no normal.
+    this.indices.fill(0, cursor);
+    this.activeIndices = cursor;
+    this.topology += 1;
+  }
+
+  private applyTearing(threshold: number) {
+    let severed = false;
+    for (let c = 0; c < this.constraintA.length; c += 1) {
+      const kind = this.constraintType[c];
+      // Bend springs sit far from rest by design; they fail with their grain.
+      if (kind === 2 || this.constraintBroken[c]) continue;
+      const a = this.constraintA[c] * 3;
+      const b = this.constraintB[c] * 3;
+      const dx = this.positions[b] - this.positions[a];
+      const dy = this.positions[b + 1] - this.positions[a + 1];
+      const dz = this.positions[b + 2] - this.positions[a + 2];
+      const limit = kind === 1 ? threshold * SHEAR_TEAR_TOLERANCE : threshold;
+      if (Math.hypot(dx, dy, dz) / this.constraintRest[c] - 1 <= limit) continue;
+      if (this.breakConstraint(c)) severed = true;
+    }
+    if (severed) this.rebuildTopology();
+  }
+
+  /** Cuts the weave inside a world-space sphere. Returns true if anything gave. */
+  tearAt(point: THREE.Vector3, radius: number) {
+    const radiusSq = radius * radius;
+    let severed = false;
+    for (let c = 0; c < this.constraintA.length; c += 1) {
+      if (this.constraintType[c] === 2 || this.constraintBroken[c]) continue;
+      const a = this.constraintA[c] * 3;
+      const b = this.constraintB[c] * 3;
+      const dx = (this.positions[a] + this.positions[b]) * 0.5 - point.x;
+      const dy = (this.positions[a + 1] + this.positions[b + 1]) * 0.5 - point.y;
+      const dz = (this.positions[a + 2] + this.positions[b + 2]) * 0.5 - point.z;
+      if (dx * dx + dy * dy + dz * dz > radiusSq) continue;
+      if (this.breakConstraint(c)) severed = true;
+    }
+    if (severed) this.rebuildTopology();
+    return severed;
+  }
+
+  /** Number of index entries currently in use; feed to `setDrawRange`. */
+  get activeIndexCount() {
+    return this.activeIndices;
+  }
+
+  /** Increments whenever triangles are dropped, so renderers can resync. */
+  get topologyVersion() {
+    return this.topology;
+  }
+
+  /** Share of the structural and shear weave still intact, 0 to 1. */
+  get integrity() {
+    return this.weaveTotal ? 1 - this.brokenWeave / this.weaveTotal : 1;
   }
 
   setMass(mass: number) {
@@ -245,6 +403,9 @@ export class ClothSimulation {
     this.previous.set(this.initial);
     this.drag = null;
     this.elapsed = 0;
+    this.constraintBroken.fill(0);
+    this.brokenWeave = 0;
+    this.rebuildTopology();
     this.setPinPattern(this.pinPattern);
   }
 
@@ -332,6 +493,10 @@ export class ClothSimulation {
       }
     }
 
+    if (settings.tearEnabled) {
+      this.applyTearing(Math.max(0.02, settings.tearStrain));
+    }
+
     this.frame += 1;
     if (this.frame % 120 === 0 && !this.isFinite()) this.reset();
   }
@@ -341,7 +506,7 @@ export class ClothSimulation {
     let max = 0;
     let samples = 0;
     for (let c = 0; c < this.constraintA.length; c += 1) {
-      if (this.constraintType[c] === 2) continue;
+      if (this.constraintType[c] === 2 || this.constraintBroken[c]) continue;
       const a = this.constraintA[c] * 3;
       const b = this.constraintB[c] * 3;
       const dx = this.positions[b] - this.positions[a];
@@ -476,6 +641,7 @@ export class ClothSimulation {
     bendStiffness: number,
   ) {
     for (let c = 0; c < this.constraintA.length; c += 1) {
+      if (this.constraintBroken[c]) continue;
       const i = this.constraintA[c];
       const j = this.constraintB[c];
       const wi = this.invMass[i];
