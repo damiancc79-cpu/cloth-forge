@@ -44,3 +44,15 @@ next-env.d.ts
 
 # local agent settings
 .claude/settings.local.json
+node_modules/
+dist/
+build/
+.next/
+out/
+coverage/
+test-results/
+playwright-report/
+.env
+.env.*
+!.env.example
+*.tar.gz
